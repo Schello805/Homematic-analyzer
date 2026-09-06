@@ -93,6 +93,72 @@ test("stuft Sabotagehinweise als kritische Servicemeldung ein", () => {
   assert.match(serviceMessages?.recommendation ?? "", /Sicherheits-|Manipulationsmeldung/);
 });
 
+test("zeigt niedrige Batterie nur im Batterie-Prüfpunkt und als Hinweis", () => {
+  const batteryEvidence = { source: "CCU Servicemeldung", detail: "Fenster Keller: Batterie niedrig" };
+  const checks = createAnalysis(
+    { ccuHost: "192.168.1.22", ccuUser: "Admin", ccuPassword: "secret" },
+    undefined,
+    failedSnapshot({
+      reachable: true,
+      devices: [{
+        name: "Fenster Keller",
+        type: "HmIP-SWDO",
+        lowBattery: true,
+        unreachable: false,
+        configPending: false,
+        evidence: [batteryEvidence]
+      }],
+      serviceMessages: [batteryEvidence],
+      counters: {
+        devices: 1,
+        lowBattery: 1,
+        unreachable: 0,
+        configPending: 0,
+        serviceMessages: 1,
+        alarmMessages: 0
+      }
+    })
+  );
+
+  assert.equal(checks.find((check) => check.id === "batteries")?.status, "warning");
+  assert.equal(checks.find((check) => check.id === "service-messages")?.status, "ok");
+  assert.equal(checks.find((check) => check.id === "service-messages")?.evidence.length, 0);
+});
+
+test("stuft ein nicht erreichbares Funk-Gateway als kritisch ein", () => {
+  const gatewayEvidence = { source: "CCU Servicemeldung", detail: "Funk-Gateway Obergeschoss: Gerätekommunikation gestört" };
+  const checks = createAnalysis(
+    { ccuHost: "192.168.1.22", ccuUser: "Admin", ccuPassword: "secret" },
+    undefined,
+    failedSnapshot({
+      reachable: true,
+      devices: [{
+        name: "Funk-Gateway Obergeschoss",
+        type: "HMLGW2",
+        lowBattery: false,
+        unreachable: true,
+        configPending: false,
+        evidence: [gatewayEvidence]
+      }],
+      serviceMessages: [gatewayEvidence],
+      counters: {
+        devices: 1,
+        lowBattery: 0,
+        unreachable: 1,
+        configPending: 0,
+        serviceMessages: 1,
+        alarmMessages: 0
+      }
+    })
+  );
+
+  const reachability = checks.find((check) => check.id === "reachability");
+  assert.equal(reachability?.status, "critical");
+  assert.match(reachability?.summary ?? "", /Funk-Gateway/);
+  assert.match(reachability?.recommendation ?? "", /Stromversorgung/);
+  assert.equal(checks.find((check) => check.id === "service-messages")?.status, "ok");
+});
+
 test("erklärt, dass Browser und Analyzer unterschiedliche Netzwerkwege nutzen", () => {
   const checks = createAnalysis(
     { ccuHost: "192.168.1.22", ccuUser: "Admin", ccuPassword: "secret" },

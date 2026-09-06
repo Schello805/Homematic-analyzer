@@ -94,6 +94,14 @@ function statusForCount(count: number, criticalAt = 1): "ok" | "critical" {
   return count >= criticalAt ? "critical" : "ok";
 }
 
+function isBatteryEvidence(evidence: Evidence): boolean {
+  return /\b(?:LOWBAT|LOW_BAT|BATTERY_LOW)\b|batter(?:ie|y)/i.test(evidence.detail);
+}
+
+function isConfigPendingEvidence(evidence: Evidence): boolean {
+  return /\b(?:CONFIG_PENDING|PENDING_CONFIG)\b|konfiguration\s+ausstehend/i.test(evidence.detail);
+}
+
 function evidenceFromDevices(devices: CcuDevice[], predicate: (device: CcuDevice) => boolean, max = 8): Evidence[] {
   return devices
     .filter(predicate)
@@ -320,6 +328,11 @@ function isCriticalServiceEvidence(evidence: Evidence): boolean {
   return /\b(?:ERROR_)?OVERHEAT\b|\bSABOTAGE\b|\b(?:SMOKE|WATER|LEAK)(?:_[A-Z0-9]+)?\b/i.test(evidence.detail);
 }
 
+function isGatewayDevice(device: Pick<CcuDevice, "name" | "type">): boolean {
+  return /^(?:HmIP-(?:HAP|WLAN-HAP|DRAP)|HmIPW-DRAP|HM-(?:LGW|CFG-LAN)|HMLGW)/i.test(device.type ?? "")
+    || /(?:funk|lan)[ -]?gateway|access[ -]?point/i.test(device.name);
+}
+
 function hasServiceOverheat(evidence: Evidence): boolean {
   return /\b(?:ERROR_)?OVERHEAT\b/i.test(evidence.detail);
 }
@@ -420,8 +433,25 @@ export function createAnalysis(
   const lowBatteryDevices = ccu?.devices.filter((device) => device.lowBattery) ?? [];
   const unreachableDevices = ccu?.devices.filter((device) => device.unreachable) ?? [];
   const unreachableServiceMessages = ccu?.serviceMessages.filter(isReachabilityEvidence) ?? [];
-  const criticalServiceMessages = ccu?.serviceMessages.filter(isCriticalServiceEvidence) ?? [];
+  const dedicatedServiceMessages = ccu?.serviceMessages.filter((message) => (
+    isBatteryEvidence(message) || isReachabilityEvidence(message) || isConfigPendingEvidence(message)
+  )) ?? [];
+  const generalServiceMessages = ccu?.serviceMessages.filter((message) => !dedicatedServiceMessages.includes(message)) ?? [];
+  const criticalServiceMessages = generalServiceMessages.filter(isCriticalServiceEvidence);
   const overheatServiceMessages = criticalServiceMessages.filter(hasServiceOverheat);
+  const knownGatewayNames = new Set(
+    routingTopology.nodes
+      .filter((node) => node.role === "gateway")
+      .flatMap((node) => [node.name, node.serial, node.address])
+      .filter((value): value is string => Boolean(value))
+      .map((value) => value.toLowerCase())
+  );
+  const unreachableGatewayDevices = unreachableDevices.filter(isGatewayDevice);
+  const unreachableGatewayMessages = unreachableServiceMessages.filter((message) => {
+    const detail = message.detail.toLowerCase();
+    return [...knownGatewayNames].some((identifier) => detail.includes(identifier));
+  });
+  const unreachableGatewayCount = Math.max(unreachableGatewayDevices.length, unreachableGatewayMessages.length);
   const unreachableEvidence = unreachableDevices.length > 0
     ? evidenceFromDevices(ccu?.devices ?? [], (device) => device.unreachable)
     : unreachableServiceMessages.slice(0, 8);
@@ -583,12 +613,12 @@ export function createAnalysis(
       id: "service-messages",
       title: "Servicemeldungen",
       category: "Geräte",
-      status: hasCcuData ? (criticalServiceMessages.length > 0 ? "critical" : ccu?.counters.serviceMessages ? "warning" : "ok") : "unavailable",
+      status: hasCcuData ? (criticalServiceMessages.length > 0 ? "critical" : generalServiceMessages.length ? "warning" : "ok") : "unavailable",
       summary: hasCcuData
         ? criticalServiceMessages.length
           ? `${criticalServiceMessages.length} kritische Servicemeldung${criticalServiceMessages.length === 1 ? "" : "en"} wurde${criticalServiceMessages.length === 1 ? "" : "n"} gefunden: ${criticalServiceMessages.slice(0, 3).map((message) => message.detail).join(", ")}.`
-          : ccu?.counters.serviceMessages
-          ? `${ccu.counters.serviceMessages} Servicemeldungen wurden gefunden.`
+          : generalServiceMessages.length
+          ? `${generalServiceMessages.length} weitere Servicemeldung${generalServiceMessages.length === 1 ? "" : "en"} wurde${generalServiceMessages.length === 1 ? "" : "n"} gefunden.`
           : "Keine Servicemeldungen gefunden."
         : "Servicemeldungen können ohne CCU-Daten nicht geprüft werden.",
       recommendation: hasCcuData
@@ -596,15 +626,15 @@ export function createAnalysis(
           ? "Überhitzung zeitnah prüfen: Gerät abkühlen lassen, Stromversorgung und Einbauort kontrollieren. Bei wiederholter Meldung Herstellerhinweise beachten."
           : criticalServiceMessages.length
           ? "Sicherheits- oder Manipulationsmeldung zeitnah prüfen. Prüfe Gerät, Umgebung und Herstellerhinweise; bei Rauch-, Wasser- oder Sabotagehinweisen sofort den realen Zustand vor Ort kontrollieren."
-          : ccu?.counters.serviceMessages
+          : generalServiceMessages.length
           ? "Prüfe die Meldungen in Ruhe. Kommunikationsstörungen werden als Hinweis bewertet, Überhitzung dagegen kritisch."
           : "Kein Handlungsbedarf."
         : "CCU-Zugang und XML-API prüfen.",
       access: ["ccu"],
-      evidence: ccu?.serviceMessages.slice(0, 8) ?? [],
+      evidence: generalServiceMessages.slice(0, 8),
       details: [
         "Servicemeldungen sind direkte Belege der Zentrale, aber nicht automatisch kritisch.",
-        "Sie helfen bei der Ursachenfindung, z. B. Batterie, Kommunikation oder Konfiguration.",
+        "Batterie, Erreichbarkeit und ausstehende Konfiguration werden ausschließlich in ihren eigenen Prüfpunkten angezeigt, damit keine Meldung doppelt erscheint.",
         "ERROR_OVERHEAT sowie eindeutige Sabotage-, Rauch- und Wassermeldungen werden als kritisch bewertet; Kommunikationsstörungen bleiben zunächst Hinweise."
       ]
     },
@@ -653,7 +683,7 @@ export function createAnalysis(
       id: "batteries",
       title: "Batterien",
       category: "Geräte",
-      status: hasCcuData ? statusForCount(lowBatteryDevices.length) : "unavailable",
+      status: hasCcuData ? (lowBatteryDevices.length > 0 ? "warning" : "ok") : "unavailable",
       summary: hasCcuData
         ? lowBatteryDevices.length
           ? `${lowBatteryDevices.length} Geräte melden einen niedrigen Batteriestand: ${deviceNames(ccu?.devices ?? [], (device) => device.lowBattery)}.`
@@ -675,22 +705,32 @@ export function createAnalysis(
       id: "reachability",
       title: "Erreichbarkeit",
       category: "Geräte",
-      status: hasCcuData ? (unreachableCount > 0 ? "warning" : "ok") : "unavailable",
+      status: hasCcuData ? (unreachableGatewayCount > 0 ? "critical" : unreachableCount > 0 ? "warning" : "ok") : "unavailable",
       summary: hasCcuData
-        ? unreachableDevices.length
+        ? unreachableGatewayCount > 0
+          ? `${unreachableGatewayCount} Funk-Gateway${unreachableGatewayCount === 1 ? "" : "s"} nicht erreichbar. Die Funkabdeckung kann dadurch deutlich eingeschränkt sein.`
+        : unreachableDevices.length
           ? `${unreachableDevices.length} Geräte sind auffällig: ${deviceNames(ccu?.devices ?? [], (device) => device.unreachable)}.`
           : unreachableServiceMessages.length
             ? `${unreachableServiceMessages.length} Erreichbarkeits-Servicemeldungen wurden gefunden.`
           : "Keine nicht erreichbaren Geräte gefunden."
         : "Erreichbarkeit kann ohne CCU-Daten nicht geprüft werden.",
       recommendation: hasCcuData
-        ? unreachableCount
+        ? unreachableGatewayCount > 0
+          ? "Kritisch: Stromversorgung, Netzwerkverbindung und Status-LED des Gateways sofort prüfen. Bis zur Wiederherstellung können zugeordnete Geräte schlechter oder gar nicht erreichbar sein."
+        : unreachableCount
           ? "Betroffene Geräte auf Strom/Batterie, Entfernung und Funkhindernisse prüfen. Kritisch wird es erst bei Alarmmeldung oder wiederholter Störung."
           : "Kein Handlungsbedarf."
         : "CCU-Zugang einrichten, um nicht erreichbare Geräte nachweisbar zu erkennen.",
       access: ["ccu"],
-      evidence: unreachableEvidence,
+      evidence: unreachableGatewayCount > 0
+        ? [
+            ...evidenceFromDevices(unreachableGatewayDevices, () => true),
+            ...unreachableGatewayMessages
+          ].slice(0, 8)
+        : unreachableEvidence,
       details: [
+        "Funk-Gateways und Access Points sind Infrastruktur. Ein belegter Ausfall wird deshalb kritisch bewertet.",
         "Als Hinweis zählen aktive Servicemeldungen der Zentrale und zuordenbare Gerätebelege.",
         "Normale Servicemeldungen sind nicht automatisch kritisch.",
         "Historische UNREACH-/STICKY_UNREACH-Rohkanäle werden nicht mehr allein als aktueller Fehler gezählt."
